@@ -1,0 +1,1 @@
+"""Agent presence (dashboard heartbeats)."""

@@ -1,0 +1,8 @@
+"""Public widget API rate limits, as (limit, window_seconds)."""
+
+SESSION_PER_IP = (20, 60)
+CONFIG_PER_IP = (120, 60)
+MESSAGE_PER_CONVERSATION = (20, 60)
+MESSAGE_PER_ORG = (600, 60)
+CONVERSATION_CREATE_PER_CUSTOMER = (10, 3600)
+CALL_TOKEN_PER_SESSION = (5, 60)

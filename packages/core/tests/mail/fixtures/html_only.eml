@@ -1,0 +1,7 @@
+From: ann@example.test
+To: support@example.test
+Subject: Html only
+Message-ID: <m2@example.test>
+Content-Type: text/html; charset=utf-8
+
+<html><head><style>p{}</style></head><body><p>First</p><div>Second<br>line</div></body></html>

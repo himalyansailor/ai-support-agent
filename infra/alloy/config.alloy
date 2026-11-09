@@ -1,0 +1,44 @@
+// Tails the JSON log files the dev servers write (SUPPORT_LOG_FILE=.data/logs/<service>.log, mounted at /logs)
+// and ships them to Loki. Labels are `service` and `level` ONLY: organisation_id, trace_id, request_id and
+// job_id stay in the JSON line (query them with `| json | organisation_id="..."`) so cardinality stays bounded.
+
+local.file_match "support" {
+  path_targets = [{"__path__" = "/logs/*.log"}]
+  sync_period  = "10s"
+}
+
+loki.source.file "support" {
+  targets       = local.file_match.support.targets
+  forward_to    = [loki.process.support.receiver]
+  tail_from_end = false
+}
+
+loki.process "support" {
+  stage.json {
+    expressions = {
+      service   = "service",
+      level     = "level",
+      timestamp = "timestamp",
+    }
+  }
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339Nano"
+  }
+  stage.labels {
+    values = {
+      service = "",
+      level   = "",
+    }
+  }
+  stage.label_drop {
+    values = ["filename"]
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

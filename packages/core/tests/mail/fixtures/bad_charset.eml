@@ -1,0 +1,8 @@
+From: ann@example.test
+To: support@example.test
+Subject: Café
+Message-ID: <m3@example.test>
+Date: not a date at all
+Content-Type: text/plain; charset=x-nonexistent
+
+Café ÿ body

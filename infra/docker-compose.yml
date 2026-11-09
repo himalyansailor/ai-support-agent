@@ -1,0 +1,290 @@
+name: support
+
+# Langfuse (LLM tracing, opt-in): `make up-langfuse` (= `docker compose --env-file .env -f
+# infra/docker-compose.yml --profile langfuse up -d`; without a .env, the shell's environment).
+# Compose reads `.env` from infra/ by default, NOT the repo root: pass `--env-file .env` (or export the
+# LANGFUSE_* variables) or the dev-only defaults below are used. Set real secrets in prod.
+# UI on http://localhost:3030. It reuses this file's Postgres (database `langfuse`, created by
+# langfuse-db-init), Redis (db 2) and MinIO (bucket `langfuse`, created by minio-init).
+# Memory: the profile needs about 2-2.5 GB free in Docker. langfuse-web needs a ~1 GB Node heap
+# (smaller heaps run out of memory within minutes), the worker ~400 MB, ClickHouse ~300 MB (dev config
+# in clickhouse/low-memory.xml). Each container has a mem_limit so an out-of-memory kill stays inside it;
+# LANGFUSE_WEB_HEAP_MB / LANGFUSE_WEB_MEM_LIMIT override web's (a smaller heap will not stay up).
+# Logs in Grafana (Loki): `make up`, then run the servers with `make dev-api` / `dev-worker` / `dev-beat`; they also
+# write JSON lines to .data/logs/<service>.log (SUPPORT_LOG_FILE, rotating 10 MB x 5; the sink is per process, so
+# `uvicorn --workers N` or several celery invocations on one host need distinct files; production logs to stdout,
+# not to this file). Alloy tails that folder into
+# Loki (7-day retention); Grafana (http://localhost:3001, admin/admin) > Explore > Loki, e.g.
+#   {service="support-api"} | json | trace_id="<id>"      (labels are only `service` and `level`)
+#   {service=~".+"} | json | organisation_id="<org uuid>"   (organisation_id is a JSON field, not a label)
+# The trace_id field has an "Open in Jaeger" link. The "Support" folder holds the Platform overview, Bot and LLM and
+# Jobs dashboards. Memory: loki (limit 256m) and alloy (192m) use ~100 MB together; stop them with
+# `docker compose stop loki alloy`. The ws_connections gauge and the queue-depth collector are per process (a
+# scrape sees one API/worker process): use sum() over series when running several. Every process writes its own log
+# file (worker pool children: worker-<slot>.log), so the Alloy glob /logs/*.log covers all of them. After editing infra/grafana/provisioning, `docker compose restart grafana`.
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://support:support@postgres:5432/langfuse
+  NEXTAUTH_URL: http://localhost:3030
+  NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-support-dev-nextauth-secret-change-me}
+  SALT: ${LANGFUSE_SALT:-support-dev-salt-change-me}
+  ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: clickhouse
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_CONNECTION_STRING: redis://redis:6379/2  # db 0 is the app's
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: support
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: supportsecret
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: support
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: supportsecret
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9000  # the browser fetches media from here
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: support
+      POSTGRES_DB: support
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6380:6379"]  # host 6379 is used by a local Redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest  # minio/minio left Docker Hub and quay
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: support
+      MINIO_ROOT_PASSWORD: supportsecret
+    ports: ["9000:9000", "9091:9001"]  # console on 9091; host 9001 is taken
+    volumes: ["miniodata:/data"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client:latest  # minio/mc is not pullable; entrypoint is `mc`
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_HOST_local: http://support:supportsecret@minio:9000
+    command: ["mb", "--ignore-existing", "local/support-documents", "local/langfuse"]  # idempotent
+    restart: "no"
+
+  chroma:
+    image: chromadb/chroma:1.0.0
+    profiles: ["chroma"]  # opt-in: docker compose --profile chroma up -d chroma
+    ports: ["8001:8000"]
+    volumes: ["chromadata:/data"]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["1025:1025", "8025:8025"]
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # cloudflared quick tunnel (opt-in, profile "tunnel"): gives apps/voice (host port 8002) a public https URL so
+  # Twilio can reach it in dev. `make up-tunnel` starts it, `make tunnel-url` prints the SUPPORT_VOICE_PUBLIC_URL
+  # line to set (the URL changes every run), `make stop-tunnel` stops it. Pinned tag (confirmed with
+  # `docker pull`): never `latest`.
+  cloudflared:
+    image: cloudflare/cloudflared:2025.9.1
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate --url http://host.docker.internal:8002
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    mem_limit: 64m
+
+  # Stripe CLI webhook forwarder (opt-in, profile "stripe"): with SUPPORT_BILLING=stripe and a test-mode key, it
+  # forwards the account's test events to the API (`make dev-api`, host port 8000). `make stripe-secret` prints the
+  # SUPPORT_STRIPE_WEBHOOK_SECRET line to set (the forwarder's signing secret, stable per key), `make up-stripe`
+  # starts it, `make stop-stripe` stops it. It needs SUPPORT_STRIPE_SECRET_KEY (sk_test_...) in the environment
+  # or the repo-root .env. Pinned tag (confirmed with `docker manifest inspect`): never `latest`.
+  stripe-cli:
+    image: stripe/stripe-cli:v1.53.1
+    profiles: ["stripe"]
+    command: listen --forward-to http://host.docker.internal:8000/billing/webhooks/stripe
+    environment:
+      STRIPE_API_KEY: ${SUPPORT_STRIPE_SECRET_KEY:-}  # `:-`: no warning on every other compose command when unset
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    mem_limit: 64m
+
+  # GreenMail (opt-in, profile "email"): a local IMAP (3143) + SMTP (3025) server for the email channel's
+  # integration tests and e2e spec. `make up-email` starts it, `make stop-email` stops it. It uses ~150 MB
+  # (mem_limit 256m, small JVM heap). The configured user is `support` / `support-dev-pass`
+  # (support@support.test). Any other recipient is auto-created on first delivery, with its address as both
+  # login and password (GreenMail docs, FAQ "How come I don't have to create any accounts"; auth stays enabled,
+  # so a wrong password is refused). Pinned tag: never `latest`.
+  greenmail:
+    image: greenmail/standalone:2.1.3
+    profiles: ["email"]
+    ports: ["3025:3025", "3143:3143"]
+    mem_limit: 256m
+    environment:
+      JAVA_OPTS: "-Xms32m -Xmx128m -XX:MaxMetaspaceSize=64m -XX:+UseSerialGC"
+      GREENMAIL_OPTS: "-Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=support:support-dev-pass@support.test"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3143'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4317:4317"]
+
+  prometheus:
+    image: prom/prometheus:v3.15.1  # pinned: the admin overview reads its HTTP query API
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes: ["./grafana/provisioning:/etc/grafana/provisioning:ro"]
+    ports: ["3001:3000"]
+    depends_on: [prometheus, jaeger, loki]
+
+  # Logs: the dev servers write JSON lines to ../.data/logs/<service>.log (SUPPORT_LOG_FILE, set by make
+  # dev-*); alloy tails them into loki; grafana (Loki datasource) searches them. Both are small:
+  # loki ~100-150 MB, alloy ~60-100 MB (limits 256m / 192m). Pinned tags: never `latest`.
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - lokidata:/loki
+    ports: ["3100:3100"]
+    mem_limit: 256m
+    environment:
+      GOMEMLIMIT: 200MiB
+
+  alloy:
+    image: grafana/alloy:v1.8.1
+    command: ["run", "--storage.path=/var/lib/alloy/data", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ../.data/logs:/logs:ro
+      - alloydata:/var/lib/alloy/data
+    depends_on: [loki]
+    mem_limit: 192m
+    environment:
+      GOMEMLIMIT: 150MiB
+
+  langfuse-db-init:
+    image: pgvector/pgvector:pg16
+    profiles: ["langfuse"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: support
+      PGPASSWORD: support
+      PGDATABASE: support
+    # init.sql only runs on a new volume: this creates the database on an existing one too (idempotent).
+    entrypoint: ["sh", "-c"]
+    command:
+      - psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'langfuse'" | grep -q 1 || psql -c "CREATE DATABASE langfuse"
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33.6
+    profiles: ["langfuse"]
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - clickhousedata:/var/lib/clickhouse
+      - clickhouselogs:/var/log/clickhouse-server
+      - ./clickhouse/low-memory.xml:/etc/clickhouse-server/config.d/low-memory.xml:ro
+    mem_limit: 768m  # uses ~250-350 MB with clickhouse/low-memory.xml
+    # No host ports: only Langfuse talks to it (and host 9000 is MinIO's).
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3.225.11
+    profiles: ["langfuse"]
+    depends_on: &langfuse-depends-on
+      langfuse-db-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+      NODE_OPTIONS: --max-old-space-size=384  # idles at ~310-390 MB RSS
+    mem_limit: 640m
+
+  langfuse-web:
+    image: langfuse/langfuse:3.225.11
+    profiles: ["langfuse"]
+    depends_on: *langfuse-depends-on
+    ports: ["3030:3000"]
+    mem_limit: ${LANGFUSE_WEB_MEM_LIMIT:-1400m}  # heap + ~300 MB native
+    environment:
+      <<: *langfuse-env
+      NODE_OPTIONS: --max-old-space-size=${LANGFUSE_WEB_HEAP_MB:-1024}  # 384-704 ran out of heap within minutes
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-support-dev}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-support-dev}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-support-dev}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-support-agent}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-support-dev}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-support-dev}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@support.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-support-dev-password}
+
+volumes:
+  pgdata:
+  miniodata:
+  chromadata:
+  clickhousedata:
+  clickhouselogs:
+  lokidata:
+  alloydata:

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Widget demo</title>
+</head>
+<body>
+  <h1>Widget demo</h1>
+  <p>Use <code>?key=wk_...</code> and optionally <code>&amp;web=http://localhost:3000</code>.</p>
+  <button id="help" type="button">Help</button>
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search);
+      var key = q.get("key");
+      var web = (q.get("web") || "http://localhost:3000").replace(/\/+$/, "");
+      document.getElementById("help").addEventListener("click", function () {
+        if (window.SupportWidget) window.SupportWidget.open();
+      });
+      if (!key) { document.body.appendChild(document.createTextNode("Missing ?key=")); return; }
+      var s = document.createElement("script");
+      s.src = web + "/widget/v1.js";
+      s.setAttribute("data-key", key);
+      s.async = true;
+      document.body.appendChild(s);
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+Returns are accepted within 30 days.

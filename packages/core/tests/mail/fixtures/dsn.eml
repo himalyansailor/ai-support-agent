@@ -1,0 +1,30 @@
+From: MAILER-DAEMON@example.test
+To: support@example.test
+Subject: Undelivered Mail Returned to Sender
+Message-ID: <dsn1@example.test>
+Return-Path: <>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="d1"
+
+--d1
+Content-Type: text/plain
+
+Could not deliver.
+--d1
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mx.example.test
+Final-Recipient: rfc822; gone@example.test
+Action: failed
+Status: 5.1.1
+
+--d1
+Content-Type: message/rfc822
+
+From: support@example.test
+To: gone@example.test
+Subject: Re: hi
+Message-ID: <orig-out@example.test>
+
+original body
+--d1--

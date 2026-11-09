@@ -1,0 +1,11 @@
+From: away@example.test
+To: support@example.test
+Subject: Out of office
+Message-ID: <m6@example.test>
+Auto-Submitted: auto-replied
+Precedence: Bulk
+X-Autoreply: yes
+Return-Path: <>
+X-Support-Mailbox: 11111111-1111-1111-1111-111111111111
+
+I am away
